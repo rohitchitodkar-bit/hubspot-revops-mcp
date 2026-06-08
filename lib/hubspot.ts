@@ -217,37 +217,21 @@ export async function getClosedDeals(daysBack = 90): Promise<HsDeal[]> {
 }
 
 export async function getAtRiskDeals(): Promise<HsDeal[]> {
-  const cutoff = Date.now() - 21 * 24 * 60 * 60 * 1000;
+  // Fetch all open deals and filter client-side.
+  // hs_lastactivitydate is not accepted as a search filter by HubSpot API (returns 400).
+  const data = await getOpenDeals(200);
   const now = Date.now();
+  const staleCutoff = now - 21 * 24 * 60 * 60 * 1000;
 
-  // Two groups: stale activity OR past close date
-  const data = await searchDeals(
-    [
-      {
-        filters: [
-          { propertyName: 'hs_is_closed', operator: 'EQ', value: 'false' },
-          {
-            propertyName: 'hs_lastactivitydate',
-            operator: 'LTE',
-            value: String(cutoff),
-          },
-        ],
-      },
-      {
-        filters: [
-          { propertyName: 'hs_is_closed', operator: 'EQ', value: 'false' },
-          {
-            propertyName: 'closedate',
-            operator: 'LTE',
-            value: String(now),
-          },
-        ],
-      },
-    ],
-    [],
-    100
-  );
-  return data.results;
+  return data.filter((deal) => {
+    const closedate = deal.properties['closedate'];
+    const lastActivity = deal.properties['hs_lastactivitydate'];
+
+    const isPastCloseDate = closedate && parseInt(closedate, 10) < now;
+    const isStale = !lastActivity || parseInt(lastActivity, 10) < staleCutoff;
+
+    return isPastCloseDate || isStale;
+  });
 }
 
 // ─── Contacts ────────────────────────────────────────────────────────────────
@@ -291,33 +275,31 @@ export async function getContactCountByLifecycleStage(): Promise<
     'other',
   ];
 
-  const counts = await Promise.all(
-    stages.map(async (stage) => {
-      try {
-        const r = await hsPost<SearchResponse<HsContact>>(
-          '/crm/v3/objects/contacts/search',
-          {
-            filterGroups: [
-              {
-                filters: [
-                  {
-                    propertyName: 'lifecyclestage',
-                    operator: 'EQ',
-                    value: stage,
-                  },
-                ],
-              },
-            ],
-            properties: [],
-            limit: 1,
-          }
-        );
-        return [stage, r.total] as [string, number];
-      } catch {
-        return [stage, 0] as [string, number];
-      }
-    })
-  );
+  // Sequential with small delay to avoid HubSpot 429 rate limit
+  const counts: [string, number][] = [];
+  for (const stage of stages) {
+    try {
+      const r = await hsPost<SearchResponse<HsContact>>(
+        '/crm/v3/objects/contacts/search',
+        {
+          filterGroups: [
+            {
+              filters: [
+                { propertyName: 'lifecyclestage', operator: 'EQ', value: stage },
+              ],
+            },
+          ],
+          properties: [],
+          limit: 1,
+        }
+      );
+      counts.push([stage, r.total]);
+    } catch {
+      counts.push([stage, 0]);
+    }
+    // 150ms gap between requests keeps us well under HubSpot's rate limit
+    await new Promise((res) => setTimeout(res, 150));
+  }
 
   return Object.fromEntries(counts);
 }
